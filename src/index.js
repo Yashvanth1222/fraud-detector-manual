@@ -254,16 +254,38 @@ function startServer() {
         try {
           const body = Buffer.concat(chunks);
           let fileBuffer;
-          try {
-            const json = JSON.parse(body.toString());
-            fileBuffer = Buffer.from(json.file_base64 || json.file || '', 'base64');
-          } catch {
-            fileBuffer = body;
+          const contentType = req.headers['content-type'] || '';
+
+          if (contentType.includes('multipart/form-data')) {
+            // Parse multipart — extract the file part
+            const boundary = contentType.split('boundary=')[1];
+            if (boundary) {
+              const parts = body.toString('binary').split('--' + boundary);
+              for (const part of parts) {
+                if (part.includes('filename=') && (part.includes('.xlsx') || part.includes('.xls'))) {
+                  const headerEnd = part.indexOf('\r\n\r\n');
+                  if (headerEnd !== -1) {
+                    const fileData = part.substring(headerEnd + 4);
+                    const trimmed = fileData.endsWith('\r\n') ? fileData.slice(0, -2) : fileData;
+                    fileBuffer = Buffer.from(trimmed, 'binary');
+                  }
+                }
+              }
+            }
           }
 
-          if (!fileBuffer || fileBuffer.length === 0) {
+          if (!fileBuffer) {
+            try {
+              const json = JSON.parse(body.toString());
+              fileBuffer = Buffer.from(json.file_base64 || json.file || '', 'base64');
+            } catch {
+              fileBuffer = body;
+            }
+          }
+
+          if (!fileBuffer || fileBuffer.length < 100) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'No file data received' }));
+            res.end(JSON.stringify({ error: 'No file data received', size: fileBuffer?.length || 0 }));
             return;
           }
 
