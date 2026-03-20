@@ -68,12 +68,10 @@ async function checkForNewUsers() {
 
   console.log(`${filtered.length} new rows found`);
   const rows = filtered.map(parseRow);
-  const uniqueUserIds = [...new Set(rows.map(r => r.user_id))];
-  console.log(`${uniqueUserIds.length} unique new user IDs`);
 
   pendingTradingData = rows;
 
-  // Write to AlreadyAnalyzed
+  // Write ALL rows to AlreadyAnalyzed so we don't re-process
   const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
   const seen = new Set();
   const analyzedOutput = [];
@@ -86,8 +84,70 @@ async function checkForNewUsers() {
   await appendRows(ANALYZED_SHEET_ID, analyzedOutput);
   console.log(`Wrote ${analyzedOutput.length} rows to AlreadyAnalyzed`);
 
-  // Send user IDs to Slack (ops channel) via n8n
-  await notifyPendingCheck(uniqueUserIds);
+  // Pre-filter: find users involved in suspicious trading patterns
+  // Group by market, find opposite-side pairs with same promo + at least 1 signal
+  const byMarket = {};
+  for (const r of rows) {
+    if (!byMarket[r.market_id]) byMarket[r.market_id] = [];
+    byMarket[r.market_id].push(r);
+  }
+
+  const suspiciousUserIds = new Set();
+  for (const [, marketRows] of Object.entries(byMarket)) {
+    if (marketRows.length < 2) continue;
+
+    const sides = {};
+    for (const r of marketRows) {
+      const side = String(r.outcome_side || '').toLowerCase();
+      if (!sides[side]) sides[side] = [];
+      sides[side].push(r);
+    }
+
+    const sideKeys = Object.keys(sides);
+    if (sideKeys.length < 2) continue;
+
+    for (let si = 0; si < sideKeys.length; si++) {
+      for (let sj = si + 1; sj < sideKeys.length; sj++) {
+        for (const u1 of sides[sideKeys[si]]) {
+          for (const u2 of sides[sideKeys[sj]]) {
+            if (u1.user_id === u2.user_id) continue;
+
+            const samePromo = u1.promo_code === u2.promo_code && u1.promo_code !== '';
+            if (!samePromo) continue;
+
+            // Parse timing
+            const ts1 = String(u1.placed_at_list || '').split(',').map(s => new Date(s.trim() + ' UTC')).filter(d => !isNaN(d));
+            const ts2 = String(u2.placed_at_list || '').split(',').map(s => new Date(s.trim() + ' UTC')).filter(d => !isNaN(d));
+            let minDelta = Infinity;
+            for (const a of ts1) for (const b of ts2) minDelta = Math.min(minDelta, Math.abs(a - b) / 1000);
+            const timingClose = minDelta <= 300;
+
+            const bothDrained = u1.balance < 1 && u2.balance < 1;
+            const exposureMatch = Math.abs(u1.user_market_exposure - u2.user_market_exposure) <= 5;
+            const bothSingle = u1.num_trades === 1 && u2.num_trades === 1;
+
+            // Need same promo + at least 1 other signal
+            const signalCount = (timingClose ? 1 : 0) + (bothDrained ? 1 : 0) + (exposureMatch ? 1 : 0) + (bothSingle ? 1 : 0);
+            if (signalCount >= 1) {
+              suspiciousUserIds.add(u1.user_id);
+              suspiciousUserIds.add(u2.user_id);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const suspiciousList = [...suspiciousUserIds];
+  console.log(`${suspiciousList.length} suspicious users (out of ${[...new Set(rows.map(r => r.user_id))].length} total) to check in GeoComply`);
+
+  if (suspiciousList.length === 0) {
+    console.log('No suspicious trading patterns found.');
+    return;
+  }
+
+  // Send only suspicious user IDs to Slack
+  await notifyPendingCheck(suspiciousList);
 }
 
 // ── Process uploaded GeoComply xlsx ──
