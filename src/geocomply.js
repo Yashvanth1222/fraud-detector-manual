@@ -21,9 +21,37 @@ export function parseGeoComplyExport(buffer) {
 
   console.log(`Sheets found: ${wb.SheetNames}`);
   const ws = wb.Sheets[wb.SheetNames[0]];
-  const rawRows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+
+  // First try with default headers (row 1)
+  let rawRows = XLSX.utils.sheet_to_json(ws, { defval: '' });
   console.log(`Raw rows parsed: ${rawRows.length}`);
   if (rawRows.length > 0) console.log(`First row keys: ${Object.keys(rawRows[0]).join(', ')}`);
+
+  // If headers are empty (__EMPTY), the real headers are in row 2 — skip row 1
+  if (rawRows.length > 0 && Object.keys(rawRows[0]).some(k => k.startsWith('__EMPTY'))) {
+    console.log('Detected blank first row — re-parsing with header row offset');
+    const allRows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+    // Find the actual header row (first row with "User ID" in it)
+    let headerIdx = -1;
+    for (let i = 0; i < Math.min(allRows.length, 5); i++) {
+      if (allRows[i].some(cell => String(cell).includes('User ID'))) {
+        headerIdx = i;
+        break;
+      }
+    }
+    if (headerIdx >= 0) {
+      const headers = allRows[headerIdx].map(h => String(h).trim());
+      console.log(`Found headers at row ${headerIdx}: ${headers.join(', ')}`);
+      rawRows = [];
+      for (let i = headerIdx + 1; i < allRows.length; i++) {
+        const obj = {};
+        headers.forEach((h, idx) => { obj[h] = allRows[i][idx] ?? ''; });
+        rawRows.push(obj);
+      }
+      console.log(`Re-parsed ${rawRows.length} rows with correct headers`);
+      if (rawRows.length > 0) console.log(`First row keys: ${Object.keys(rawRows[0]).join(', ')}`);
+    }
+  }
 
   const records = [];
   for (const row of rawRows) {
