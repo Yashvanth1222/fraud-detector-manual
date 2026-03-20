@@ -1,9 +1,6 @@
 const WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 
-// C0ANANSNVTK = ops channel (user IDs to check + xlsx upload)
-// C0AMRE7RFJP = alerts channel (confirmed fraud results)
-
-export async function notifyPendingCheck(userIds) {
+export async function notifyPendingCheck(userIds, batchNum = 1, totalBatches = 1) {
   if (!WEBHOOK_URL || userIds.length === 0) return;
 
   const payload = {
@@ -11,7 +8,9 @@ export async function notifyPendingCheck(userIds) {
     channel: 'C0ANANSNVTK',
     user_ids: userIds,
     user_id_list: userIds.join('\n'),
-    count: userIds.length
+    count: userIds.length,
+    batch_num: batchNum,
+    total_batches: totalBatches
   };
 
   try {
@@ -21,7 +20,7 @@ export async function notifyPendingCheck(userIds) {
       body: JSON.stringify(payload)
     });
     if (!res.ok) console.error(`Pending check webhook failed (${res.status})`);
-    else console.log(`Sent pending check for ${userIds.length} users to ops channel`);
+    else console.log(`Sent batch ${batchNum}/${totalBatches} (${userIds.length} users) to ops channel`);
   } catch (e) {
     console.error('Pending check webhook error:', e.message);
   }
@@ -53,6 +52,26 @@ export async function notifyFraudResult(result) {
     else console.log(`Sent fraud alert: ${result.market_description} (score ${result.score})`);
   } catch (e) {
     console.error('Fraud result webhook error:', e.message);
+  }
+}
+
+export async function notifyStatus(message) {
+  if (!WEBHOOK_URL) return;
+
+  const payload = {
+    type: 'status',
+    channel: 'C0ANANSNVTK',
+    message
+  };
+
+  try {
+    await fetch(WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+  } catch (e) {
+    console.error('Status webhook error:', e.message);
   }
 }
 

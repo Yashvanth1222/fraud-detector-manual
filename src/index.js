@@ -4,15 +4,18 @@ import http from 'http';
 import { readSheet, appendRows } from './sheets.js';
 import { parseGeoComplyExport } from './geocomply.js';
 import { scorePairs } from './score.js';
-import { notifyPendingCheck, notifyFraudResult } from './notify.js';
+import { notifyPendingCheck, notifyFraudResult, notifyStatus } from './notify.js';
 
 const FRAUD_SHEET_ID = process.env.FRAUD_SHEET_ID;
 const ANALYZED_SHEET_ID = process.env.ANALYZED_SHEET_ID;
 const SCORE_THRESHOLD = parseInt(process.env.SCORE_THRESHOLD) || 70;
 const PORT = parseInt(process.env.PORT) || 3000;
+const BATCH_SIZE = 500;
 
 // In-memory state
 let pendingTradingData = [];
+let userQueue = [];       // full list of suspicious users, batched
+let currentBatchIndex = 0; // which batch we're on
 
 function parseRow(r) {
   return {
@@ -36,7 +39,27 @@ function parseRow(r) {
   };
 }
 
-// ── Check Hex sheet for new users, notify Slack ──
+// ── Send the current batch to Slack ──
+async function sendCurrentBatch() {
+  if (userQueue.length === 0) return;
+
+  const totalBatches = Math.ceil(userQueue.length / BATCH_SIZE);
+  const start = currentBatchIndex * BATCH_SIZE;
+  const batch = userQueue.slice(start, start + BATCH_SIZE);
+
+  if (batch.length === 0) {
+    console.log('All batches processed!');
+    await notifyStatus(`All ${totalBatches} batches processed. ${userQueue.length} total users checked.`);
+    userQueue = [];
+    currentBatchIndex = 0;
+    return;
+  }
+
+  console.log(`Sending batch ${currentBatchIndex + 1}/${totalBatches} (${batch.length} users)`);
+  await notifyPendingCheck(batch, currentBatchIndex + 1, totalBatches);
+}
+
+// ── Check Hex sheet for new users ──
 async function checkForNewUsers() {
   console.log(`[${new Date().toISOString()}] Checking Hex sheet for new users...`);
 
@@ -68,10 +91,9 @@ async function checkForNewUsers() {
 
   console.log(`${filtered.length} new rows found`);
   const rows = filtered.map(parseRow);
-
   pendingTradingData = rows;
 
-  // Write ALL rows to AlreadyAnalyzed so we don't re-process
+  // Write ALL rows to AlreadyAnalyzed
   const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
   const seen = new Set();
   const analyzedOutput = [];
@@ -84,8 +106,7 @@ async function checkForNewUsers() {
   await appendRows(ANALYZED_SHEET_ID, analyzedOutput);
   console.log(`Wrote ${analyzedOutput.length} rows to AlreadyAnalyzed`);
 
-  // Pre-filter: find users involved in suspicious trading patterns
-  // Group by market, find opposite-side pairs with same promo + at least 1 signal
+  // Pre-filter: find suspicious users
   const byMarket = {};
   for (const r of rows) {
     if (!byMarket[r.market_id]) byMarket[r.market_id] = [];
@@ -95,14 +116,12 @@ async function checkForNewUsers() {
   const suspiciousUserIds = new Set();
   for (const [, marketRows] of Object.entries(byMarket)) {
     if (marketRows.length < 2) continue;
-
     const sides = {};
     for (const r of marketRows) {
       const side = String(r.outcome_side || '').toLowerCase();
       if (!sides[side]) sides[side] = [];
       sides[side].push(r);
     }
-
     const sideKeys = Object.keys(sides);
     if (sideKeys.length < 2) continue;
 
@@ -111,22 +130,19 @@ async function checkForNewUsers() {
         for (const u1 of sides[sideKeys[si]]) {
           for (const u2 of sides[sideKeys[sj]]) {
             if (u1.user_id === u2.user_id) continue;
-
             const samePromo = u1.promo_code === u2.promo_code && u1.promo_code !== '';
             if (!samePromo) continue;
 
-            // Parse timing
             const ts1 = String(u1.placed_at_list || '').split(',').map(s => new Date(s.trim() + ' UTC')).filter(d => !isNaN(d));
             const ts2 = String(u2.placed_at_list || '').split(',').map(s => new Date(s.trim() + ' UTC')).filter(d => !isNaN(d));
             let minDelta = Infinity;
             for (const a of ts1) for (const b of ts2) minDelta = Math.min(minDelta, Math.abs(a - b) / 1000);
-            const timingClose = minDelta <= 300;
 
+            const timingClose = minDelta <= 300;
             const bothDrained = u1.balance < 1 && u2.balance < 1;
             const exposureMatch = Math.abs(u1.user_market_exposure - u2.user_market_exposure) <= 5;
             const bothSingle = u1.num_trades === 1 && u2.num_trades === 1;
 
-            // Need same promo + at least 1 other signal
             const signalCount = (timingClose ? 1 : 0) + (bothDrained ? 1 : 0) + (exposureMatch ? 1 : 0) + (bothSingle ? 1 : 0);
             if (signalCount >= 1) {
               suspiciousUserIds.add(u1.user_id);
@@ -139,15 +155,17 @@ async function checkForNewUsers() {
   }
 
   const suspiciousList = [...suspiciousUserIds];
-  console.log(`${suspiciousList.length} suspicious users (out of ${[...new Set(rows.map(r => r.user_id))].length} total) to check in GeoComply`);
+  console.log(`${suspiciousList.length} suspicious users to check in GeoComply`);
 
   if (suspiciousList.length === 0) {
     console.log('No suspicious trading patterns found.');
     return;
   }
 
-  // Send only suspicious user IDs to Slack
-  await notifyPendingCheck(suspiciousList);
+  // Set up the queue and send first batch
+  userQueue = suspiciousList;
+  currentBatchIndex = 0;
+  await sendCurrentBatch();
 }
 
 // ── Process uploaded GeoComply xlsx ──
@@ -174,12 +192,10 @@ async function processGeoComplyFile(buffer) {
   console.log(`Suspicious (50-${SCORE_THRESHOLD - 1}): ${suspicious.length}`);
   console.log(`Clean (<50): ${results.length - confirmed.length - suspicious.length}`);
 
-  // Send confirmed fraud to alerts channel via n8n
   for (const result of confirmed) {
     await notifyFraudResult(result);
   }
 
-  // Update AlreadyAnalyzed with fraud scores
   const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
   const fraudUpdates = [];
   for (const result of confirmed) {
@@ -190,38 +206,58 @@ async function processGeoComplyFile(buffer) {
   }
   if (fraudUpdates.length > 0) await appendRows(ANALYZED_SHEET_ID, fraudUpdates);
 
-  return { confirmed: confirmed.length, suspicious: suspicious.length, total_pairs: results.length };
+  // Advance to next batch and send it
+  const totalBatches = Math.ceil(userQueue.length / BATCH_SIZE);
+  currentBatchIndex++;
+  const hasMoreBatches = currentBatchIndex < totalBatches;
+
+  if (hasMoreBatches) {
+    console.log(`Batch ${currentBatchIndex}/${totalBatches} done. Sending next batch...`);
+    await sendCurrentBatch();
+  } else if (userQueue.length > 0) {
+    console.log('All batches complete!');
+    await notifyStatus(`All ${totalBatches} batches processed. Queue complete.`);
+    userQueue = [];
+    currentBatchIndex = 0;
+  }
+
+  return {
+    confirmed: confirmed.length,
+    suspicious: suspicious.length,
+    total_pairs: results.length,
+    batch_completed: currentBatchIndex,
+    total_batches: totalBatches,
+    has_more_batches: hasMoreBatches
+  };
 }
 
-// ── HTTP server to receive xlsx uploads from n8n ──
+// ── HTTP server ──
 function startServer() {
   const server = http.createServer(async (req, res) => {
-    // Health check
     if (req.method === 'GET' && req.url === '/health') {
+      const totalBatches = Math.ceil(userQueue.length / BATCH_SIZE);
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'ok', pending_users: pendingTradingData.length }));
+      res.end(JSON.stringify({
+        status: 'ok',
+        pending_trading_rows: pendingTradingData.length,
+        queue_size: userQueue.length,
+        current_batch: currentBatchIndex + 1,
+        total_batches: totalBatches
+      }));
       return;
     }
 
-    // Receive xlsx file from n8n
     if (req.method === 'POST' && req.url === '/upload-geocomply') {
       const chunks = [];
       req.on('data', chunk => chunks.push(chunk));
       req.on('end', async () => {
         try {
           const body = Buffer.concat(chunks);
-
-          // Check if it's JSON with base64 file, or raw binary
           let fileBuffer;
           try {
             const json = JSON.parse(body.toString());
-            if (json.file_base64) {
-              fileBuffer = Buffer.from(json.file_base64, 'base64');
-            } else if (json.file) {
-              fileBuffer = Buffer.from(json.file, 'base64');
-            }
+            fileBuffer = Buffer.from(json.file_base64 || json.file || '', 'base64');
           } catch {
-            // Raw binary upload
             fileBuffer = body;
           }
 
@@ -233,7 +269,6 @@ function startServer() {
 
           console.log(`Received GeoComply file: ${fileBuffer.length} bytes`);
           const result = await processGeoComplyFile(fileBuffer);
-
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ status: 'processed', ...result }));
         } catch (e) {
@@ -245,12 +280,15 @@ function startServer() {
       return;
     }
 
-    // Force refresh trading data
     if (req.method === 'POST' && req.url === '/refresh') {
       try {
         await checkForNewUsers();
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'refreshed', pending_users: pendingTradingData.length }));
+        res.end(JSON.stringify({
+          status: 'refreshed',
+          queue_size: userQueue.length,
+          total_batches: Math.ceil(userQueue.length / BATCH_SIZE)
+        }));
       } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: e.message }));
@@ -262,9 +300,7 @@ function startServer() {
     res.end('Not found');
   });
 
-  server.listen(PORT, () => {
-    console.log(`HTTP server listening on port ${PORT}`);
-  });
+  server.listen(PORT, () => console.log(`HTTP server listening on port ${PORT}`));
 }
 
 // ── Main ──
@@ -272,17 +308,12 @@ if (process.argv.includes('--once')) {
   checkForNewUsers().catch(e => { console.error('Run failed:', e); process.exit(1); });
 } else {
   startServer();
-
-  // Check for new users every 30 minutes
   cron.schedule('*/30 * * * *', () => {
     checkForNewUsers().catch(e => console.error('Sheet check failed:', e));
   });
-
-  // Run immediately on startup
   checkForNewUsers().catch(e => console.error('Initial check failed:', e));
-
   console.log('Fraud detector (manual mode) running.');
   console.log(`  - HTTP server: port ${PORT}`);
   console.log('  - Hex sheet check: every 30 minutes');
-  console.log('  - POST /upload-geocomply to process xlsx');
+  console.log('  - Batch size: 500 users per GeoComply check');
 }
