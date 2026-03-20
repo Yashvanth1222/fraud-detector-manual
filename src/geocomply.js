@@ -1,9 +1,29 @@
 import XLSX from 'xlsx';
 
 export function parseGeoComplyExport(buffer) {
-  const wb = XLSX.read(buffer, { type: 'buffer' });
+  // Debug: log file signature to verify it's a valid xlsx
+  const header = buffer.slice(0, 4).toString('hex');
+  console.log(`File header bytes: ${header} (expect 504b0304 for xlsx)`);
+  console.log(`File size: ${buffer.length} bytes`);
+
+  let wb;
+  try {
+    wb = XLSX.read(buffer, { type: 'buffer' });
+  } catch (e) {
+    console.error('XLSX.read failed with buffer, trying array:', e.message);
+    try {
+      wb = XLSX.read(new Uint8Array(buffer), { type: 'array' });
+    } catch (e2) {
+      console.error('XLSX.read failed with array too:', e2.message);
+      return { records: [], deviceToUsers: {}, userToDevices: {}, sharedDevices: {}, blockedUsers: new Set(), blockedDevices: new Set() };
+    }
+  }
+
+  console.log(`Sheets found: ${wb.SheetNames}`);
   const ws = wb.Sheets[wb.SheetNames[0]];
   const rawRows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+  console.log(`Raw rows parsed: ${rawRows.length}`);
+  if (rawRows.length > 0) console.log(`First row keys: ${Object.keys(rawRows[0]).join(', ')}`);
 
   const records = [];
   for (const row of rawRows) {
